@@ -1,0 +1,21 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Editor files
+*.swp
+*.swo
+*.idea/
+.vscode/
+
+# Playwright cache and logs
+.playwright/
+
+# Misc
+*.log
