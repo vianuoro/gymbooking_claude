@@ -43,3 +43,26 @@ playwright install
 
 python server.py
 ...open index.html and enjoy!
+
+## Simple booking with curl
+
+If you want to book a class directly from Bash, use the included `book_class.sh` script.
+You need a valid cookie jar and current form tokens from the Nordic Wellness booking page.
+
+```bash
+./book_class.sh ACTIVITY_ID REQUEST_TOKEN UFPRT COOKIE_JAR [DATE]
+```
+
+Example:
+
+```bash
+./book_class.sh 147573892 CfDJ8...Nfm cookies.txt 2026-04-27
+```
+
+The script sends a form POST to:
+
+```bash
+https://nordicwellness.se/boka/boka-grupptraning/
+```
+
+It uses `curl` with multipart form data and preserves cookies from `COOKIE_JAR`.
