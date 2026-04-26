@@ -64,11 +64,26 @@ def _new_browser():
 
 
 def _do_login(page, email: str, password: str):
-    """Fill and submit the login form, raise on failure."""
+    """Fill and submit the login form, raise on failure.
+
+    The Nordic Wellness login page has TWO email inputs:
+      - input[name="email"]  id="forgot-email"  (hidden password-reset form)
+      - input[name="email"]  inside the visible login form
+
+    We must target only the VISIBLE one using Playwright's filter(visible=True).
+    """
     page.goto(LOGIN_URL, wait_until="networkidle", timeout=30_000)
-    page.fill('input[name="Email"], input[type="email"]', email)
-    page.fill('input[name="Password"], input[type="password"]', password)
-    page.click('button[type="submit"], input[type="submit"]')
+
+    # Target only the visible login form inputs, not the hidden reset form
+    email_input    = page.locator('form input[name="email"]').filter(visible=True).first
+    password_input = page.locator('form input[type="password"]').filter(visible=True).first
+    submit_btn     = page.locator('form button[type="submit"]').filter(visible=True).first
+
+    email_input.wait_for(state="visible", timeout=15_000)
+    email_input.fill(email)
+    password_input.fill(password)
+    submit_btn.click()
+
     page.wait_for_load_state("networkidle", timeout=20_000)
     if "logga-in" in page.url:
         raise ValueError("Login failed – check your credentials")
