@@ -63,31 +63,128 @@ def _new_browser():
     return pw, browser, ctx
 
 
+def _dismiss_cookie_banner(page):
+    """Click away the CookieScript consent banner (confirmed on nordicwellness.se)."""
+    try:
+        # CookieScript banner — confirmed present via debug
+        for sel in [
+            '#cookiescript_accept',           # "Accept all" button
+            '#cookiescript_acceptall',
+            'button[id*="cookiescript"]',
+            'button[class*="cookiescript"]',
+            # Fallbacks
+            'button:has-text("Acceptera alla")',
+            'button:has-text("Acceptera")',
+            'button:has-text("Accept all")',
+            'button:has-text("Accept")',
+        ]:
+            try:
+                btn = page.locator(sel).first
+                if btn.is_visible(timeout=800):
+                    btn.click()
+                    log.info("Dismissed cookie banner via: %s", sel)
+                    page.wait_for_timeout(1000)
+                    return
+            except Exception:
+                continue
+        log.info("No cookie banner found (or already dismissed)")
+    except Exception:
+        pass
+
+
 def _do_login(page, email: str, password: str):
-    """Fill and submit the login form, raise on failure.
+    """Fill and submit the login form using JS injection (most reliable)."""
+    import os
 
-    The Nordic Wellness login page has TWO email inputs:
-      - input[name="email"]  id="forgot-email"  (hidden password-reset form)
-      - input[name="email"]  inside the visible login form
+    log.info("Navigating to login page...")
+    page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
+    page.wait_for_timeout(2000)
 
-    We must target only the VISIBLE one using Playwright's filter(visible=True).
-    """
-    page.goto(LOGIN_URL, wait_until="networkidle", timeout=30_000)
+    # Dismiss cookie consent banner first — it can block inputs
+    _dismiss_cookie_banner(page)
+    page.wait_for_timeout(1000)
 
-    # Target only the visible login form inputs, not the hidden reset form
-    email_input    = page.locator('form input[name="email"]').filter(visible=True).first
-    password_input = page.locator('form input[type="password"]').filter(visible=True).first
-    submit_btn     = page.locator('form button[type="submit"]').filter(visible=True).first
+    # Save debug info
+    debug_dir = "/tmp/nw_debug"
+    os.makedirs(debug_dir, exist_ok=True)
+    page.screenshot(path=f"{debug_dir}/login_page.png", full_page=True)
+    with open(f"{debug_dir}/login_page.html", "w") as f:
+        f.write(page.content())
 
-    email_input.wait_for(state="visible", timeout=15_000)
-    email_input.fill(email)
-    password_input.fill(password)
-    submit_btn.click()
+    inputs = page.evaluate("""
+    () => [...document.querySelectorAll('input')].map(i => ({
+        name: i.name, type: i.type, id: i.id,
+        visible: i.offsetParent !== null,
+        display: window.getComputedStyle(i).display,
+        visibility: window.getComputedStyle(i).visibility,
+        rect: i.getBoundingClientRect(),
+    }))
+    """)
+    log.info("Inputs found on login page:")
+    for i in inputs:
+        log.info("  %s", i)
+
+    # Confirmed field names from /debug:
+    #   email    → input[name="Username"]  type="text"   id="Username"
+    #   password → input[name="Password"]  type="password" id="Password"
+    def fill_field(name, value):
+        page.evaluate(f"""
+        () => {{
+            const el = document.querySelector('input[name="{name}"]');
+            if (!el) return;
+            el.focus();
+            el.value = {repr(value)};
+            el.dispatchEvent(new Event('input',  {{bubbles: true}}));
+            el.dispatchEvent(new Event('change', {{bubbles: true}}));
+        }}
+        """)
+        log.info("Filled input[name=%s]", name)
+
+    fill_field("Username", email)
+    fill_field("Password", password)
+
+    # Small pause so framework registers the values
+    page.wait_for_timeout(500)
+
+    # Try multiple submit strategies in order
+    submitted = page.evaluate("""
+    () => {
+        // Strategy 1: click the visible submit button via real mouse event
+        const btns = [...document.querySelectorAll('button[type="submit"], input[type="submit"]')];
+        const btn = btns.find(b => b.offsetParent !== null) || btns[0];
+        if (btn) {
+            btn.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+            return 'clicked-' + btn.tagName;
+        }
+        // Strategy 2: submit the form directly
+        const form = document.querySelector('form');
+        if (form) { form.submit(); return 'form-submit'; }
+        return 'none';
+    }
+    """)
+    log.info("Submit strategy used: %s", submitted)
+
+    # Wait for navigation away from login page
+    try:
+        page.wait_for_url(lambda url: "logga-in" not in url, timeout=15_000)
+        log.info("Navigated away from login page OK")
+    except Exception:
+        # URL didn't change — try Playwright's own click as fallback
+        log.warning("URL did not change after JS submit, trying Playwright click...")
+        try:
+            page.locator('button[type="submit"]').last.click(timeout=5_000)
+            page.wait_for_url(lambda url: "logga-in" not in url, timeout=15_000)
+        except Exception as e:
+            log.warning("Playwright click also failed: %s", e)
 
     page.wait_for_load_state("networkidle", timeout=20_000)
+    log.info("After login URL: %s", page.url)
+
     if "logga-in" in page.url:
-        raise ValueError("Login failed – check your credentials")
-    log.info("Logged in OK, url=%s", page.url)
+        page.screenshot(path=f"{debug_dir}/login_failed.png", full_page=True)
+        raise ValueError("Login failed – wrong credentials or site is blocking headless browser.")
+
+    log.info("Logged in OK")
 
 
 # ── Scraping ──────────────────────────────────────────────────────────────────
@@ -181,8 +278,12 @@ def login_and_fetch(email: str, password: str):
         _do_login(page, email, password)
 
         log.info("Loading booking page…")
-        page.goto(BOOK_URL, wait_until="networkidle", timeout=30_000)
-        page.wait_for_selector("h3.text-sm, h3[class*='font-medium']", timeout=20_000)
+        page.goto(BOOK_URL, wait_until="networkidle", timeout=60_000)
+        # Wait for at least one class h3 to exist in DOM (not necessarily visible)
+        page.wait_for_selector("h3.text-sm, h3[class*='font-medium']",
+                               state="attached", timeout=20_000)
+        # Extra settle time for all cards to render
+        page.wait_for_timeout(2000)
 
         classes = page.evaluate(_SCRAPE_JS)
         log.info("Scraped %d classes", len(classes))
@@ -194,30 +295,104 @@ def login_and_fetch(email: str, password: str):
 
 # ── Booking worker ────────────────────────────────────────────────────────────
 
+def _scrape_my_bookings(session, cookies_dict: dict) -> list:
+    """
+    Scrape nordicwellness.se/mina-sidor using Playwright (JS-rendered page).
+    Returns list of dicts: {name, raw} where raw contains all text in the card.
+    """
+    pw, browser, ctx = _new_browser()
+    try:
+        # Inject cookies so we're logged in
+        ctx.add_cookies([
+            {"name": k, "value": v, "domain": "nordicwellness.se", "path": "/"}
+            for k, v in cookies_dict.items()
+        ])
+        page = ctx.new_page()
+        page.goto("https://nordicwellness.se/mina-sidor", wait_until="networkidle", timeout=30_000)
+        page.wait_for_timeout(2000)
+
+        bookings = page.evaluate("""
+        () => {
+            const results = [];
+            // Each booked class has an h3 with the class name
+            const h3s = [...document.querySelectorAll('h3')].filter(
+                h => h.innerText.trim().length > 2
+            );
+            for (const h3 of h3s) {
+                const card = h3.closest('div') || h3.parentElement;
+                const allText = card ? card.innerText : h3.innerText;
+                results.push({
+                    name: h3.innerText.trim(),
+                    raw:  allText.toLowerCase(),
+                });
+            }
+            return results;
+        }
+        """)
+        log.info("Found %d entries on mina-sidor", len(bookings))
+        return bookings
+    finally:
+        browser.close()
+        pw.stop()
+
+
+def _booking_confirmed(bookings_before: list, bookings_after: list,
+                       class_name: str, class_time: str, class_gym: str) -> bool:
+    """
+    Return True if the target class appears in bookings_after but not bookings_before.
+    Logs every entry so we can debug mismatches.
+    """
+    # Extract first word of time e.g. "19:00 - 19:45" -> "19:00"
+    time_prefix = class_time.split("-")[0].strip()[:5] if class_time else ""
+    # First token of gym e.g. "Göteborg Domkyrkan" -> "domkyrkan"
+    gym_token   = class_gym.lower().split()[-1][:8] if class_gym else ""
+    # First word of class name e.g. "Virtual BODYPUMP® 45" -> "bodypump"
+    name_token  = class_name.lower().replace("virtual ", "").split()[0][:8]
+
+    log.info("Matching against: name_token=%r time_prefix=%r gym_token=%r",
+             name_token, time_prefix, gym_token)
+
+    def matches(b: dict) -> bool:
+        raw  = b["raw"]
+        name = b["name"].lower()
+        name_ok = name_token in name or name_token in raw
+        time_ok = not time_prefix or time_prefix in raw
+        gym_ok  = not gym_token   or gym_token  in raw
+        log.info("  Entry %r | name_ok=%s time_ok=%s gym_ok=%s | raw=%r",
+                 b["name"][:40], name_ok, time_ok, gym_ok, raw[:80])
+        return name_ok and time_ok and gym_ok
+
+    before_matches = sum(1 for b in bookings_before if matches(b))
+    after_matches  = sum(1 for b in bookings_after  if matches(b))
+    log.info("Booking check: before=%d after=%d", before_matches, after_matches)
+    return after_matches > before_matches
+
+
 def do_booking(email: str, password: str, activity_id: str,
                csrf1: str, csrf2: str, form_action: str,
                class_name: str = "", class_date: str = "",
                class_time: str = "", class_gym: str = ""):
     """
     Background thread:
-      1. Log in with Playwright to get a valid cookie jar.
-      2. Re-scrape fresh CSRF tokens for this activityId.
-      3. POST the booking form every 3 ms until success or stopped.
+      1. Log in with Playwright, get cookies + fresh CSRF tokens.
+      2. Snapshot /mina-sidor#bokningar as baseline.
+      3. Hammer the booking POST every 3 ms.
+      4. Every 10 s, re-check /mina-sidor — if the class appears, stop.
     """
     import requests as req_lib
-    from playwright.sync_api import sync_playwright
 
-    # Step 1 & 2: fresh login + fresh tokens via Playwright
+    # ── Step 1: Login + fresh tokens ─────────────────────────────────────
     pw, browser, ctx = _new_browser()
     cookies_dict = {}
     try:
         page = ctx.new_page()
         _do_login(page, email, password)
 
-        page.goto(BOOK_URL, wait_until="networkidle", timeout=30_000)
-        page.wait_for_selector("h3.text-sm, h3[class*='font-medium']", timeout=20_000)
+        page.goto(BOOK_URL, wait_until="networkidle", timeout=60_000)
+        page.wait_for_selector("h3.text-sm, h3[class*='font-medium']",
+                               state="attached", timeout=20_000)
+        page.wait_for_timeout(2000)
 
-        # Refresh tokens from the live DOM (they may differ from those scraped earlier)
         fresh = page.evaluate(f"""
         () => {{
             const inp = document.querySelector('input[name="activityId"][value="{activity_id}"]');
@@ -230,24 +405,25 @@ def do_booking(email: str, password: str, activity_id: str,
             }};
         }}
         """)
-
         if fresh and fresh.get("csrf1"):
             csrf1       = fresh["csrf1"]
             csrf2       = fresh["csrf2"]
             form_action = fresh["formAction"]
             log.info("Refreshed CSRF tokens OK")
         else:
-            log.warning("Could not find form for activityId=%s in DOM, using cached tokens", activity_id)
+            log.warning("Could not refresh CSRF tokens, using cached ones")
 
-        # Export browser cookies → requests
         for c in ctx.cookies():
             cookies_dict[c["name"]] = c["value"]
-
     finally:
         browser.close()
         pw.stop()
 
-    # Step 3: hammer with requests (much faster than Playwright for rapid POSTs)
+    # ── Step 2: Baseline snapshot of mina-sidor ───────────────────────────
+    log.info("Taking baseline snapshot of mina-sidor...")
+    bookings_before = _scrape_my_bookings(None, cookies_dict)
+
+    # ── Step 3+4: Hammer + periodic confirmation check ────────────────────
     s = req_lib.Session()
     s.headers.update({
         "User-Agent": (
@@ -271,8 +447,11 @@ def do_booking(email: str, password: str, activity_id: str,
         booking_state["class_gym"]     = class_gym
         booking_state["activity_id"]   = activity_id
 
-    log.info("Hammering activityId=%s [%s %s %s %s] every 3 ms",
-             activity_id, class_date, class_name, class_time, class_gym)
+    log.info("Hammering activityId=%s [%s %s %s] every 3ms, checking mina-sidor every 10s",
+             activity_id, class_date, class_name, class_time)
+
+    last_check_time = time.time()
+    CHECK_INTERVAL  = 10  # seconds between mina-sidor polls
 
     while True:
         with booking_lock:
@@ -280,6 +459,7 @@ def do_booking(email: str, password: str, activity_id: str,
                 booking_state["status"] = "stopped"
                 break
 
+        # ── POST attempt ──────────────────────────────────────────────────
         try:
             r = s.post(
                 target,
@@ -291,35 +471,44 @@ def do_booking(email: str, password: str, activity_id: str,
                 timeout=5,
                 allow_redirects=True,
             )
-
-            snippet = r.text[:300].replace("\n", " ")
-            success = any(w in r.text.lower() for w in (
-                "bokad", "booked", "bekräft", "confirmed",
-                "din bokning", "tack för", "success",
-            ))
-
             with booking_lock:
                 booking_state["attempts"]     += 1
-                booking_state["last_response"] = f"HTTP {r.status_code} — {snippet[:140]}"
+                booking_state["last_response"] = f"HTTP {r.status_code} | {r.url[:60]}"
 
-                if success:
-                    booking_state["success"] = True
-                    booking_state["running"] = False
-                    booking_state["status"]  = "success"
-                    log.info("🎉 Booked! activityId=%s", activity_id)
-                    break
-
-                if r.status_code in (401, 403):
+            if r.status_code in (401, 403):
+                with booking_lock:
                     booking_state["running"]       = False
                     booking_state["status"]        = "auth_error"
-                    booking_state["last_response"] = f"Auth error {r.status_code} – session expired"
-                    break
+                    booking_state["last_response"] = f"Auth error {r.status_code}"
+                break
 
         except Exception as e:
             with booking_lock:
                 booking_state["last_response"] = str(e)[:140]
 
-        time.sleep(0.003)   # 3 ms between attempts
+        # ── Periodic mina-sidor check ─────────────────────────────────────
+        now = time.time()
+        if now - last_check_time >= CHECK_INTERVAL:
+            last_check_time = now
+            try:
+                log.info("Checking mina-sidor for booking confirmation...")
+                bookings_after = _scrape_my_bookings(None, cookies_dict)
+                if _booking_confirmed(bookings_before, bookings_after,
+                                      class_name, class_time, class_gym):
+                    with booking_lock:
+                        booking_state["success"] = True
+                        booking_state["running"] = False
+                        booking_state["status"]  = "success"
+                        booking_state["last_response"] = "✓ Confirmed on mina-sidor!"
+                    log.info("🎉 Booking confirmed on mina-sidor! Stopping.")
+                    break
+                else:
+                    with booking_lock:
+                        booking_state["last_response"] = "Not yet on mina-sidor, continuing…"
+            except Exception as e:
+                log.warning("mina-sidor check failed: %s", e)
+
+        time.sleep(0.003)   # 3 ms between POST attempts
 
 
 # ── Flask routes ──────────────────────────────────────────────────────────────
@@ -327,6 +516,43 @@ def do_booking(email: str, password: str, activity_id: str,
 @app.route("/")
 def index():
     return send_from_directory(".", "index.html")
+
+
+@app.route("/debug")
+def debug():
+    """Opens the login page in Playwright and returns what it sees as HTML+JSON."""
+    import os, base64
+    pw, browser, ctx = _new_browser()
+    try:
+        page = ctx.new_page()
+        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
+        page.wait_for_timeout(3000)
+        _dismiss_cookie_banner(page)
+        page.wait_for_timeout(1000)
+
+        screenshot = page.screenshot(full_page=True)
+        img_b64 = base64.b64encode(screenshot).decode()
+
+        inputs = page.evaluate("""
+        () => [...document.querySelectorAll('input')].map(i => ({
+            name: i.name, type: i.type, id: i.id,
+            visible: i.offsetParent !== null,
+            display: window.getComputedStyle(i).display,
+        }))
+        """)
+
+        html = f"""<!DOCTYPE html><html><body style="font-family:monospace;padding:20px;background:#111;color:#eee">
+        <h2 style="color:#c8ff00">Login Page Debug</h2>
+        <h3>Screenshot:</h3>
+        <img src="data:image/png;base64,{img_b64}" style="max-width:100%;border:1px solid #444"/>
+        <h3>Inputs found ({len(inputs)}):</h3>
+        <pre style="background:#222;padding:12px;overflow:auto">{inputs}</pre>
+        <h3>Current URL: {page.url}</h3>
+        </body></html>"""
+        return html
+    finally:
+        browser.close()
+        pw.stop()
 
 
 @app.route("/login", methods=["POST"])
