@@ -359,6 +359,10 @@
 
   <div class="status-panel">
     <div class="status-row">
+      <span class="status-key">BOOKING TARGET</span>
+      <span class="status-val" id="s-target" style="max-width:65%;text-align:right;font-size:11px">–</span>
+    </div>
+    <div class="status-row">
       <span class="status-key">STATE</span>
       <span class="status-val" id="s-status">–</span>
     </div>
@@ -468,6 +472,9 @@
     const email    = document.getElementById('email').value.trim();
     const password = document.getElementById('password').value.trim();
 
+    const targetLabel = [selectedClass.date, selectedClass.name, selectedClass.time, selectedClass.gym]
+      .filter(Boolean).join('  ·  ');
+
     const res = await fetch('/book', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -478,10 +485,17 @@
         csrf1:       selectedClass.csrf1,
         csrf2:       selectedClass.csrf2,
         formAction:  selectedClass.formAction,
+        className:   selectedClass.name,
+        classDate:   selectedClass.date,
+        classTime:   selectedClass.time,
+        classGym:    selectedClass.gym,
       })
     });
     const data = await res.json();
     if (!data.ok) { alert(data.error); return; }
+
+    // Show exactly which class is being hammered
+    document.getElementById('s-target').textContent = targetLabel;
 
     document.getElementById('status-section').style.display = 'block';
     document.getElementById('status-section').scrollIntoView({ behavior: 'smooth' });
@@ -500,6 +514,12 @@
       sStatus.textContent = d.status.toUpperCase();
       sStatus.className = 'status-val' + (d.success ? ' success' : d.status === 'stopped' ? ' error' : '');
       sResponse.textContent = d.last_response || '–';
+
+      // Keep target in sync with server (survives page refresh)
+      if (d.class_name) {
+        document.getElementById('s-target').textContent =
+          [d.class_date, d.class_name, d.class_time, d.class_gym].filter(Boolean).join('  ·  ');
+      }
 
       const statusMsg = document.getElementById('status-msg');
 

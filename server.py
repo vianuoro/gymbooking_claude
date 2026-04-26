@@ -27,7 +27,6 @@ BOOK_URL  = (
     "&klubb=24200&klubb=13898&klubb=6809&klubb=164&klubb=31049"
     "&typ=5517&typ=17915&typ=4622"
 )
-REQUEST_TIMEOUT = 30
 
 # ── Global booking state ──────────────────────────────────────────────────────
 booking_state = {
@@ -36,6 +35,11 @@ booking_state = {
     "status":        "idle",
     "last_response": "",
     "success":       False,
+    "class_name":    "",
+    "class_date":    "",
+    "class_time":    "",
+    "class_gym":     "",
+    "activity_id":   "",
 }
 booking_lock   = threading.Lock()
 booking_thread = None
@@ -61,79 +65,13 @@ def _new_browser():
 
 def _do_login(page, email: str, password: str):
     """Fill and submit the login form, raise on failure."""
-    log.info("Navigating to login page...")
-    page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
-
-    # Wait a bit and log all input elements for debugging
-    page.wait_for_timeout(2000)
-    inputs = page.query_selector_all('input')
-    log.info("Found %d input elements on page:", len(inputs))
-    for i, inp in enumerate(inputs[:10]):  # Log first 10 inputs
-        attrs = page.evaluate("""
-        (el) => ({
-            type: el.type,
-            name: el.name,
-            id: el.id,
-            placeholder: el.placeholder,
-            visible: el.offsetWidth > 0 && el.offsetHeight > 0,
-            className: el.className
-        })
-        """, inp)
-        log.info("  Input %d: %s", i, attrs)
-
-    # Wait for the login form to be visible
-    log.info("Waiting for login form elements...")
-    try:
-        # The login form uses 'Username' not 'Email'
-        page.wait_for_selector('input[name="Username"]', timeout=30_000)
-    except Exception as e:
-        log.error("Username input not found. Page title: %s", page.title())
-        log.error("Page URL: %s", page.url)
-        raise ValueError(f"Login form not found: {e}")
-
-    # Additional wait to ensure the element is interactable
-    page.wait_for_timeout(1000)
-
-    log.info("Filling username field...")
-    page.fill('input[name="Username"]', email)
-
-    log.info("Filling password field...")
-    page.fill('input[name="Password"]', password)
-
-    # Handle cookie consent dialog
-    log.info("Checking for cookie consent dialog...")
-    try:
-        # Try to hide the cookie dialog
-        page.evaluate("""
-        () => {
-            const cookieDialog = document.getElementById('cookiescript_injected_wrapper') || 
-                               document.getElementById('cookiescript_injected');
-            if (cookieDialog) {
-                cookieDialog.style.display = 'none';
-                cookieDialog.remove();
-            }
-        }
-        """)
-        log.info("Removed cookie dialog")
-        page.wait_for_timeout(500)
-    except Exception as e:
-        log.info("Could not remove cookie dialog: %s", e)
-
-    log.info("Submitting login form...")
-    try:
-        # Try clicking the submit button
-        page.click('button[type="submit"]', timeout=10000)
-    except:
-        # If click fails, try pressing Enter in the password field
-        log.info("Click failed, trying Enter key...")
-        page.press('input[name="Password"]', 'Enter')
-
-    log.info("Waiting for login to complete...")
+    page.goto(LOGIN_URL, wait_until="networkidle", timeout=30_000)
+    page.fill('input[name="Email"], input[type="email"]', email)
+    page.fill('input[name="Password"], input[type="password"]', password)
+    page.click('button[type="submit"], input[type="submit"]')
     page.wait_for_load_state("networkidle", timeout=20_000)
-
     if "logga-in" in page.url:
         raise ValueError("Login failed – check your credentials")
-
     log.info("Logged in OK, url=%s", page.url)
 
 
@@ -228,7 +166,7 @@ def login_and_fetch(email: str, password: str):
         _do_login(page, email, password)
 
         log.info("Loading booking page…")
-        page.goto(BOOK_URL, wait_until="domcontentloaded", timeout=30_000)
+        page.goto(BOOK_URL, wait_until="networkidle", timeout=30_000)
         page.wait_for_selector("h3.text-sm, h3[class*='font-medium']", timeout=20_000)
 
         classes = page.evaluate(_SCRAPE_JS)
@@ -242,7 +180,9 @@ def login_and_fetch(email: str, password: str):
 # ── Booking worker ────────────────────────────────────────────────────────────
 
 def do_booking(email: str, password: str, activity_id: str,
-               csrf1: str, csrf2: str, form_action: str):
+               csrf1: str, csrf2: str, form_action: str,
+               class_name: str = "", class_date: str = "",
+               class_time: str = "", class_gym: str = ""):
     """
     Background thread:
       1. Log in with Playwright to get a valid cookie jar.
@@ -259,7 +199,7 @@ def do_booking(email: str, password: str, activity_id: str,
         page = ctx.new_page()
         _do_login(page, email, password)
 
-        page.goto(BOOK_URL, wait_until="domcontentloaded", timeout=30_000)
+        page.goto(BOOK_URL, wait_until="networkidle", timeout=30_000)
         page.wait_for_selector("h3.text-sm, h3[class*='font-medium']", timeout=20_000)
 
         # Refresh tokens from the live DOM (they may differ from those scraped earlier)
@@ -293,21 +233,7 @@ def do_booking(email: str, password: str, activity_id: str,
         pw.stop()
 
     # Step 3: hammer with requests (much faster than Playwright for rapid POSTs)
-    from requests.adapters import HTTPAdapter
-    from urllib3.util.retry import Retry
-
     s = req_lib.Session()
-    retries = Retry(
-        total=5,
-        backoff_factor=0.5,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["POST"],
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retries)
-    s.mount("https://", adapter)
-    s.mount("http://", adapter)
-
     s.headers.update({
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -320,13 +246,18 @@ def do_booking(email: str, password: str, activity_id: str,
     s.cookies.update(cookies_dict)
     target = form_action or BOOK_URL
 
-    consecutive_errors = 0
     with booking_lock:
         booking_state["status"]        = "booking"
         booking_state["attempts"]      = 0
         booking_state["last_response"] = "Starting…"
+        booking_state["class_name"]    = class_name
+        booking_state["class_date"]    = class_date
+        booking_state["class_time"]    = class_time
+        booking_state["class_gym"]     = class_gym
+        booking_state["activity_id"]   = activity_id
 
-    log.info("Hammering activityId=%s every 3 ms", activity_id)
+    log.info("Hammering activityId=%s [%s %s %s %s] every 3 ms",
+             activity_id, class_date, class_name, class_time, class_gym)
 
     while True:
         with booking_lock:
@@ -342,7 +273,7 @@ def do_booking(email: str, password: str, activity_id: str,
                     "__RequestVerificationToken": csrf1,
                     "ufprt":                      csrf2,
                 },
-                timeout=REQUEST_TIMEOUT,
+                timeout=5,
                 allow_redirects=True,
             )
 
@@ -369,30 +300,11 @@ def do_booking(email: str, password: str, activity_id: str,
                     booking_state["last_response"] = f"Auth error {r.status_code} – session expired"
                     break
 
-                if r.status_code >= 500:
-                    consecutive_errors += 1
-                    booking_state["last_response"] = f"Server error {r.status_code} — retrying"
-                    sleep_time = min(1.0, 0.05 * (2 ** consecutive_errors))
-                else:
-                    consecutive_errors = 0
-                    sleep_time = 0.003
-
-        except req_lib.exceptions.ReadTimeout as e:
-            consecutive_errors += 1
-            sleep_time = min(1.0, 0.05 * (2 ** consecutive_errors))
+        except Exception as e:
             with booking_lock:
-                booking_state["last_response"] = f"Read timeout, retrying: {str(e)[:120]}"
-            log.warning("Read timeout while posting booking, retrying")
-        except req_lib.exceptions.RequestException as e:
-            consecutive_errors += 1
-            sleep_time = min(1.0, 0.05 * (2 ** consecutive_errors))
-            with booking_lock:
-                booking_state["last_response"] = f"Request error, retrying: {str(e)[:120]}"
-            log.warning("Request exception while posting booking: %s", e)
-        else:
-            sleep_time = 0.003
+                booking_state["last_response"] = str(e)[:140]
 
-        time.sleep(sleep_time)
+        time.sleep(0.003)   # 3 ms between attempts
 
 
 # ── Flask routes ──────────────────────────────────────────────────────────────
@@ -428,6 +340,10 @@ def book():
     csrf1       = data.get("csrf1",      "")
     csrf2       = data.get("csrf2",      "")
     form_action = data.get("formAction", "")
+    class_name  = data.get("className",  "")
+    class_date  = data.get("classDate",  "")
+    class_time  = data.get("classTime",  "")
+    class_gym   = data.get("classGym",   "")
 
     if not all([email, password, activity_id]):
         return jsonify({"ok": False, "error": "email, password, activityId required"}), 400
@@ -435,11 +351,15 @@ def book():
     with booking_lock:
         if booking_state["running"]:
             return jsonify({"ok": False, "error": "Already running"}), 409
-        booking_state.update(running=True, success=False, attempts=0, status="starting")
+        booking_state.update(running=True, success=False, attempts=0, status="starting",
+                             class_name=class_name, class_date=class_date,
+                             class_time=class_time, class_gym=class_gym,
+                             activity_id=activity_id)
 
     booking_thread = threading.Thread(
         target=do_booking,
-        args=(email, password, activity_id, csrf1, csrf2, form_action),
+        args=(email, password, activity_id, csrf1, csrf2, form_action,
+              class_name, class_date, class_time, class_gym),
         daemon=True,
     )
     booking_thread.start()
