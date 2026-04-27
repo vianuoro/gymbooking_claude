@@ -103,14 +103,23 @@ else
 fi
 
 # Install into venv if available, otherwise system/user
-if [ -d ".venv" ]; then
-    info "Existing .venv detected — installing into it"
+# Clean up broken venv if activate script is missing
+if [ -d ".venv" ] && [ ! -f ".venv/bin/activate" ]; then
+    warn "Broken .venv detected — removing and recreating..."
+    rm -rf .venv
+fi
+
+if [ -f ".venv/bin/activate" ]; then
+    info "Existing .venv detected — activating it"
     source .venv/bin/activate
-elif command -v python3 -m venv --help &>/dev/null; then
-    info "Creating virtual environment (.venv)..."
-    python3 -m venv .venv
+elif python3 -m venv .venv 2>/dev/null && [ -f ".venv/bin/activate" ]; then
+    info "Created virtual environment (.venv)"
     source .venv/bin/activate
     info "Virtual environment activated"
+else
+    warn "Could not create venv — installing to user site-packages (pip install --user)"
+    rm -rf .venv 2>/dev/null || true
+    $PIP install --quiet --user --upgrade pip 2>/dev/null || true
 fi
 
 $PIP install --quiet --upgrade pip
