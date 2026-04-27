@@ -4,7 +4,7 @@ Nordic Wellness Gym Class Booking Automator
 Uses Playwright to render JS, scrape classes, and hammer the booking form.
 
 Install deps:
-    pip install flask flask-cors playwright requests
+    pip install flask flask-cors playwright requests aiohttp
     playwright install chromium
 """
 
@@ -375,13 +375,15 @@ def do_booking(email: str, password: str, activity_id: str,
     """
     Background thread:
       1. Log in with Playwright, get cookies + fresh CSRF tokens.
-      2. Snapshot /mina-sidor#bokningar as baseline.
-      3. Hammer the booking POST every 3 ms.
-      4. Every 10 s, re-check /mina-sidor — if the class appears, stop.
+      2. Snapshot /mina-sidor as baseline.
+      3. Fire async POSTs as fast as possible using aiohttp.
+         — No waiting for responses; requests are fire-and-forget.
+         — A separate coroutine polls mina-sidor every 10s to confirm booking.
     """
-    import requests as req_lib
+    import asyncio
+    import aiohttp
 
-    # ── Step 1: Login + fresh tokens ─────────────────────────────────────
+    # ── Step 1: Login + fresh tokens ──────────────────────────────────────
     pw, browser, ctx = _new_browser()
     cookies_dict = {}
     try:
@@ -423,92 +425,112 @@ def do_booking(email: str, password: str, activity_id: str,
     log.info("Taking baseline snapshot of mina-sidor...")
     bookings_before = _scrape_my_bookings(None, cookies_dict)
 
-    # ── Step 3+4: Hammer + periodic confirmation check ────────────────────
-    s = req_lib.Session()
-    s.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Referer": BOOK_URL,
-        "Origin":  "https://nordicwellness.se",
-    })
-    s.cookies.update(cookies_dict)
-    target = form_action or BOOK_URL
-
+    # ── Step 3: Async hammer loop ─────────────────────────────────────────
     with booking_lock:
-        booking_state["status"]        = "booking"
-        booking_state["attempts"]      = 0
-        booking_state["last_response"] = "Starting…"
-        booking_state["class_name"]    = class_name
-        booking_state["class_date"]    = class_date
-        booking_state["class_time"]    = class_time
-        booking_state["class_gym"]     = class_gym
-        booking_state["activity_id"]   = activity_id
+        booking_state.update(
+            status        = "booking",
+            attempts      = 0,
+            last_response = "Starting…",
+            class_name    = class_name,
+            class_date    = class_date,
+            class_time    = class_time,
+            class_gym     = class_gym,
+            activity_id   = activity_id,
+        )
 
-    log.info("Hammering activityId=%s [%s %s %s] every 3ms, checking mina-sidor every 10s",
-             activity_id, class_date, class_name, class_time)
+    target  = form_action or BOOK_URL
+    payload = {
+        "activityId":                 activity_id,
+        "__RequestVerificationToken": csrf1,
+        "ufprt":                      csrf2,
+    }
+    # Convert cookies for aiohttp
+    cookie_jar_items = list(cookies_dict.items())
 
-    last_check_time = time.time()
-    CHECK_INTERVAL  = 10  # seconds between mina-sidor polls
+    log.info("Async hammering activityId=%s — fire-and-forget POSTs, mina-sidor check every 10s",
+             activity_id)
 
-    while True:
-        with booking_lock:
-            if not booking_state["running"]:
-                booking_state["status"] = "stopped"
-                break
+    async def _run():
+        CHECK_INTERVAL = 10  # seconds
+        last_check     = asyncio.get_event_loop().time()
 
-        # ── POST attempt ──────────────────────────────────────────────────
-        try:
-            r = s.post(
-                target,
-                data={
-                    "activityId":                 activity_id,
-                    "__RequestVerificationToken": csrf1,
-                    "ufprt":                      csrf2,
-                },
-                timeout=5,
-                allow_redirects=True,
-            )
-            with booking_lock:
-                booking_state["attempts"]     += 1
-                booking_state["last_response"] = f"HTTP {r.status_code} | {r.url[:60]}"
+        connector = aiohttp.TCPConnector(limit=0, ssl=False)
+        headers   = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Referer": BOOK_URL,
+            "Origin":  "https://nordicwellness.se",
+        }
+        jar = aiohttp.CookieJar(unsafe=True)
+        async with aiohttp.ClientSession(
+            connector=connector,
+            headers=headers,
+            cookie_jar=jar,
+        ) as session:
+            # Inject cookies
+            for name, value in cookie_jar_items:
+                jar.update_cookies({name: value},
+                                   response_url=aiohttp.client.URL("https://nordicwellness.se"))
 
-            if r.status_code in (401, 403):
+            async def _fire():
+                """Fire a single POST and discard the response immediately."""
+                try:
+                    async with session.post(
+                        target, data=payload,
+                        allow_redirects=False,
+                        timeout=aiohttp.ClientTimeout(total=5),
+                    ):
+                        pass   # response body never read — pure fire-and-forget
+                except Exception:
+                    pass
+
+            while True:
                 with booking_lock:
-                    booking_state["running"]       = False
-                    booking_state["status"]        = "auth_error"
-                    booking_state["last_response"] = f"Auth error {r.status_code}"
-                break
+                    if not booking_state["running"]:
+                        booking_state["status"] = "stopped"
+                        return
 
-        except Exception as e:
-            with booking_lock:
-                booking_state["last_response"] = str(e)[:140]
+                # Fire POST without awaiting response body
+                asyncio.ensure_future(_fire())
 
-        # ── Periodic mina-sidor check ─────────────────────────────────────
-        now = time.time()
-        if now - last_check_time >= CHECK_INTERVAL:
-            last_check_time = now
-            try:
-                log.info("Checking mina-sidor for booking confirmation...")
-                bookings_after = _scrape_my_bookings(None, cookies_dict)
-                if _booking_confirmed(bookings_before, bookings_after,
-                                      class_name, class_time, class_gym):
-                    with booking_lock:
-                        booking_state["success"] = True
-                        booking_state["running"] = False
-                        booking_state["status"]  = "success"
-                        booking_state["last_response"] = "✓ Confirmed on mina-sidor!"
-                    log.info("🎉 Booking confirmed on mina-sidor! Stopping.")
-                    break
-                else:
-                    with booking_lock:
-                        booking_state["last_response"] = "Not yet on mina-sidor, continuing…"
-            except Exception as e:
-                log.warning("mina-sidor check failed: %s", e)
+                with booking_lock:
+                    booking_state["attempts"] += 1
+                    booking_state["last_response"] = (
+                        f"Fired {booking_state['attempts']:,} requests (async, no wait)"
+                    )
 
-        time.sleep(0.003)   # 3 ms between POST attempts
+                # ── Periodic mina-sidor check ─────────────────────────────
+                now = asyncio.get_event_loop().time()
+                if now - last_check >= CHECK_INTERVAL:
+                    last_check = now
+                    log.info("Checking mina-sidor for booking confirmation...")
+                    try:
+                        # Run blocking Playwright call in executor
+                        loop = asyncio.get_event_loop()
+                        bookings_after = await loop.run_in_executor(
+                            None, _scrape_my_bookings, None, cookies_dict
+                        )
+                        if _booking_confirmed(bookings_before, bookings_after,
+                                              class_name, class_time, class_gym):
+                            with booking_lock:
+                                booking_state["success"]       = True
+                                booking_state["running"]       = False
+                                booking_state["status"]        = "success"
+                                booking_state["last_response"] = "✓ Confirmed on mina-sidor!"
+                            log.info("🎉 Booking confirmed on mina-sidor! Stopping.")
+                            return
+                        else:
+                            log.info("Not yet on mina-sidor, continuing…")
+                    except Exception as e:
+                        log.warning("mina-sidor check failed: %s", e)
+
+                await asyncio.sleep(0.03)   # 30 ms between POST attempts
+
+    asyncio.run(_run())
+
 
 
 # ── Flask routes ──────────────────────────────────────────────────────────────
@@ -625,6 +647,6 @@ if __name__ == "__main__":
     print("\n🏋️  Nordic Wellness Booking Automator")
     print("   Open  http://localhost:5000  in your browser\n")
     print("   First-time setup:")
-    print("     pip install flask flask-cors playwright requests")
+    print("     pip install flask flask-cors playwright requests aiohttp")
     print("     playwright install chromium\n")
     app.run(host="0.0.0.0", port=5000, debug=False)
